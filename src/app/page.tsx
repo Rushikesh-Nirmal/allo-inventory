@@ -11,10 +11,15 @@ export default async function HomePage() {
     },
   });
 
-  const data = products.map((p) => ({
-    ...p,
-    stock: p.stock.map((s) => ({ ...s, available: s.total - s.reserved })),
-  }));
+const data = products.map((p) => ({
+  ...p,
+  stock: p.stock.map((s) => ({
+    ...s,
+    available: s.total - s.reserved,
+    warehouseName: s.warehouse.name,
+    warehouseLocation: s.warehouse.location,
+  })),
+}));
 
   const warehouseCount = [...new Set(data.flatMap((p) => p.stock.map((s) => s.warehouseId)))].length;
   const totalStock = data.reduce((sum, p) => sum + p.stock.reduce((a, s) => a + s.available, 0), 0);
