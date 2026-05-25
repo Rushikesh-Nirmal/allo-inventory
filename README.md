@@ -1,36 +1,127 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Allo Inventory — Take-Home Exercise
 
-## Getting Started
+A Next.js inventory and reservation platform for multi-warehouse retail. Customers can reserve items during checkout, preventing overselling without locking up stock for abandoned carts.
 
-First, run the development server:
+**Live URL:** https://allo-inventory-one-iota.vercel.app  
+**GitHub:** https://github.com/Rushikesh-Nirmal/allo-inventory
+
+---
+
+## How to run locally
+
+### 1. Clone and install
+
+```bash
+
+### 2. Set up environment variables
+
+Create a `.env` file with:
+
+DATABASE_URL
+UPSTASH_REDIS_REST_URL
+UPSTASH_REDIS_REST_TOKEN
+CRON_SECRET
+
+### 3. Run migrations and seed
+
+```bash
+npx prisma generate
+npx prisma db push
+npx tsx prisma/seed.ts
+```
+
+### 4. Start the dev server
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## How concurrency safety works
 
-## Learn More
+The core problem: two simultaneous requests for the last unit of a SKU must not both succeed.
 
-To learn more about Next.js, take a look at the following resources:
+**Solution: `SELECT ... FOR UPDATE` inside a Postgres transaction.**
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```sql
+BEGIN;
+  SELECT id, total, reserved FROM "Stock" WHERE id = $1 FOR UPDATE;
+  UPDATE "Stock" SET reserved = reserved + $2 WHERE id = $1;
+  INSERT INTO "Reservation" ...;
+COMMIT;
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- `FOR UPDATE` acquires an exclusive row-level lock in Postgres
+- Concurrent transactions queue up; each sees the committed state of the previous
+- The second request reads `available = 0` and correctly returns 409
+- No race condition is possible — the check and increment are atomic
 
-## Deploy on Vercel
+---
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## How reservation expiry works in production
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Two-layer approach:
+
+**Layer 1 — Lazy expiry on confirm:** When `/confirm` is called, the server checks `expiresAt` before acting. If expired, releases the reservation and returns `410 Gone`.
+
+**Layer 2 — Vercel Cron (optional):** `vercel.json` can schedule a cleanup job. On the free tier, lazy expiry alone is sufficient.
+
+---
+
+## How idempotency works
+
+If a client sends the same `Idempotency-Key` header on a retry, the server returns the original response without repeating the side effect.
+
+**Implemented for:** `POST /api/reservations` and `POST /api/reservations/:id/confirm`
+
+1. Client generates a UUID → attaches as `Idempotency-Key` header
+2. Server checks Upstash Redis for that key
+3. Cache hit → return stored response immediately
+4. Cache miss → run handler, store result in Redis (24hr TTL), return it
+
+---
+
+## Data model
+
+Product ──< Stock >── Warehouse
+│
+└──< Reservation
+
+- `Stock.total` — physical units in the warehouse
+- `Stock.reserved` — units held by PENDING reservations
+- `Stock.available` (computed) = `total - reserved`
+- On **confirm**: `reserved -= qty`, `total -= qty`
+- On **release/expire**: `reserved -= qty` only
+
+---
+
+## Trade-offs and things I'd do differently
+
+**What I'd add with more time:**
+- Real-time stock updates via WebSocket/SSE
+- User authentication
+- Quantity selector (currently hardcoded to 1)
+- Mock payment step
+- Metrics and monitoring
+
+**Conscious decisions:**
+- `SELECT FOR UPDATE` over Redis locking — correctness in the DB, no extra infra
+- Lazy expiry as primary mechanism — reliable without a persistent worker
+- Server Components for initial data fetch — no client loading states
+- `available` computed not stored — avoids sync bugs
+
+---
+
+## API reference
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/products` | Products with available stock per warehouse |
+| GET | `/api/warehouses` | All warehouses |
+| POST | `/api/reservations` | Create reservation. `409` if insufficient stock. Supports `Idempotency-Key` |
+| POST | `/api/reservations/:id/confirm` | Confirm payment. `410` if expired. Supports `Idempotency-Key` |
+| POST | `/api/reservations/:id/release` | Release early (cancelled/failed) |
+| GET | `/api/cron/expire-reservations` | Cleanup expired reservations. Requires `Authorization: Bearer <CRON_SECRET>` |
